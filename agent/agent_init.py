@@ -1210,6 +1210,19 @@ def init_agent(
     # are noisy.
     agent._environment_probe = bool(_agent_section.get("environment_probe", True))
 
+    # Quiet mode — suppress verbose mid-tool progress narration.
+    # When True (default), the agent only emits final status / errors,
+    # not a status line after every tool call.  Configurable via
+    # ``agent.quiet_mode`` in config.yaml.  Per-session override via
+    # the ``/quiet`` and ``/verbose`` slash commands handled in
+    # ``gateway/platforms/telegram.py`` and friends.
+    # Default: True (silent-by-default) — matches user feedback 2026-06-04
+    # that hermes-agent was "嘴碎" (too chatty with progress reports).
+    # Also follows the existing ``agent.quiet_mode`` runtime toggle (used
+    # for log/print suppression in compression / trajectory code) so the
+    # two stay aligned: when one is on, the other is on.
+    agent._quiet_mode = bool(_agent_section.get("quiet_mode", agent.quiet_mode))
+
     # App-level API retry count (wraps each model API call).  Default 3,
     # overridable via agent.api_max_retries in config.yaml.  See #11616.
     try:

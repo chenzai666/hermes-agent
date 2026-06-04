@@ -297,6 +297,30 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+# Quiet-mode (沉默优先) — when ``agent._quiet_mode`` is True (the default),
+# the agent should not narrate every tool call, intermediate state change, or
+# self-correction step in user-visible chat.  Default to ONE final summary at
+# the end of a multi-step task.  Triggered by user feedback 2026-06-04 that
+# hermes-agent was "嘴碎" (too chatty): even when told "只报结果" or "静默处理"
+# the agent kept emitting per-step status lines.  Toggled per-session via
+# ``/quiet`` and ``/verbose`` slash commands on supported platforms; globally
+# via ``agent.quiet_mode`` in config.yaml (default True).
+QUIET_MODE_GUIDANCE = (
+    "# Silent by default\n"
+    "Do not narrate every tool call, intermediate state change, or self-\n"
+    "correction step in user-visible chat. After a tool runs, the user can\n"
+    "already see the result in the conversation transcript — re-stating it\n"
+    "in prose (\"清理已完成 / 定位到 / 继续 / 静默处理\") is noise.\n"
+    "Default to ONE final summary at the end of a multi-step task that\n"
+    "states: (1) what you did, (2) what the result was, (3) what is left or\n"
+    "blocked. Mid-task status lines are only allowed when the user explicitly\n"
+    "asks for progress (\"hindsight 进度如何\") or when something blocks for\n"
+    "more than ~30 seconds and a heartbeat is useful.\n"
+    "User instructions like \"只报结果\", \"静默处理\", \"直接干\" all mean the\n"
+    "same thing here: keep the running narration suppressed, deliver the\n"
+    "final report only."
+)
+
 # OpenAI GPT/Codex-specific execution guidance.  Addresses known failure modes
 # where GPT models abandon work on partial results, skip prerequisite lookups,
 # hallucinate instead of using tools, and declare "done" without verification.

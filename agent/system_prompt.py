@@ -35,6 +35,7 @@ from agent.prompt_builder import (
     MEMORY_GUIDANCE,
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     PLATFORM_HINTS,
+    QUIET_MODE_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
     SKILLS_GUIDANCE,
     TASK_COMPLETION_GUIDANCE,
@@ -109,6 +110,15 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # users who want a leaner prompt can turn it off.
     if getattr(agent, "_task_completion_guidance", True) and agent.valid_tool_names:
         stable_parts.append(TASK_COMPLETION_GUIDANCE)
+
+    # Silent-by-default (quiet_mode).  Default True.  When True, inject the
+    # silent-by-default guidance block so the model treats per-tool
+    # narration as opt-in, not opt-out.  Toggle via config.yaml
+    # ``agent.quiet_mode`` (default True) or per-session ``/quiet`` /
+    # ``/verbose`` slash commands.  See QUIET_MODE_GUIDANCE in
+    # ``agent.prompt_builder`` for the full text.
+    if getattr(agent, "_quiet_mode", True):
+        stable_parts.append(QUIET_MODE_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []
