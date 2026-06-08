@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
+from agent.memory_manager import StreamingContextScrubber as _StreamingContextScrubber
 from gateway.platforms.base import BasePlatformAdapter as _BasePlatformAdapter
 from gateway.platforms.base import _custom_unit_to_cp
 from gateway.platforms.base import MEDIA_TAG_CLEANUP_RE
@@ -74,6 +75,46 @@ class StreamConsumerConfig:
     # "group", "supergroup", "forum").  Used to gate native draft streaming,
     # which is platform-specific (Telegram drafts are DM-only).
     chat_type: str = ""
+
+    # --- Telegram edit-mode merge controls (feat/telegram-edit-mode-merge) ---
+    # The defaults are conservative: only ``placeholder_typing`` is on by
+    # default because it's strictly additive (a new "⏳" message that the
+    # next edit will replace). The two merge flags default to False so the
+    # existing per-segment / per-commentary "one bubble per item" contract
+    # is preserved across Discord, Slack, Signal, and other channels that
+    # share this consumer.
+    #
+    # The Telegram channel config opts into the full scheme-2 behavior
+    # (merge_interim_text=True, merge_segment_breaks=True) where the UX
+    # matches Bocchi's "one persistent message, edited in place" request.
+    #
+    # 1. ``merge_interim_text`` (default False): assistant commentary
+    #    emitted between tool calls (e.g. "I'll inspect the repo first.")
+    #    is appended to the current streaming message via edit_message
+    #    instead of being delivered as a brand-new standalone message.
+    #    When no message exists yet, commentary still creates a new
+    #    message — there's nothing to merge into.
+    #
+    # 2. ``merge_segment_breaks`` (default False): ``on_segment_break``
+    #    no longer resets ``_message_id`` to None. The next text segment
+    #    edits the same message so a tool round-trip produces one
+    #    user-visible message instead of two adjacent messages. Only the
+    #    *visible content* is reset; the message id and edit bookkeeping
+    #    are preserved.
+    #
+    # 3. ``placeholder_typing`` + ``placeholder_delay_seconds`` (defaults:
+    #    True / 1.5s): when streaming starts but no delta has been
+    #    delivered yet, the consumer sends a "⏳ 正在思考..." placeholder
+    #    after the delay and replaces it via edit_message when the first
+    #    real delta lands. Set ``placeholder_text`` to override. Disabled
+    #    on adapters that already send a native draft (Telegram DM with
+    #    PTB 22.6+) — drafts are a strictly better version of the same
+    #    idea.
+    merge_interim_text: bool = False
+    merge_segment_breaks: bool = False
+    placeholder_typing: bool = True
+    placeholder_delay_seconds: float = 1.5
+    placeholder_text: str = "⏳ 正在思考..."
 
 
 class GatewayStreamConsumer:
@@ -168,6 +209,24 @@ class GatewayStreamConsumer:
         # Think-block filter state (mirrors CLI's _stream_delta tag suppression)
         self._in_think_block = False
         self._think_buffer = ""
+        self._context_scrubber = _StreamingContextScrubber()
+
+        # --- Telegram edit-mode merge state (feat/telegram-edit-mode-merge) ---
+        # True once at least one real (non-placeholder) delta has been
+        # accumulated this run. Used to decide when the placeholder can be
+        # safely replaced with a real edit.
+        self._placeholder_active: bool = False
+        # Wall-clock time of stream start. The consumer arms a "send
+        # placeholder if no delta has landed" timer in run() and clears it
+        # as soon as the first delta arrives.
+        self._stream_started_ts: Optional[float] = None
+        self._placeholder_armed: bool = False
+        # Length function and platform message budget, resolved in run()
+        # and reused by helper methods that fire after run() returns
+        # (e.g. _send_commentary). Pre-set to safe defaults so the helpers
+        # don't NameError if invoked before run() has populated them.
+        self._len_fn: "Callable[[str], int]" = len
+        self._safe_limit: int = 4096
 
         # Native draft-streaming state.  Resolved at the start of run() based
         # on cfg.transport, cfg.chat_type, and the adapter's
@@ -255,6 +314,25 @@ class GatewayStreamConsumer:
     def _reset_segment_state(self, *, preserve_no_edit: bool = False) -> None:
         if preserve_no_edit and self._message_id == "__no_edit__":
             return
+        # --- feat/telegram-edit-mode-merge ---
+        # When segment-break merging is enabled we keep ``_message_id`` so
+        # the next text segment edits the same bubble the user is already
+        # reading, separated by a visual divider. Only the *visible text*
+        # state is reset.
+        if self.cfg.merge_segment_breaks and self._message_id not in (None, "__no_edit__"):
+            self._accumulated = ""
+            self._last_sent_text = ""
+            self._fallback_final_send = False
+            self._fallback_prefix = ""
+            # Keep _message_id, _message_created_ts, _already_sent, and
+            # _edit_supported intact. _notify_new_message is also skipped:
+            # there is no "new bubble" — the existing one is being reused.
+            # We do still bump the draft id so native draft streaming
+            # animates a fresh preview below the prior finalized draft.
+            if self._use_draft_streaming:
+                type(self)._draft_id_counter += 1
+                self._draft_id = type(self)._draft_id_counter
+            return
         self._message_id = None
         self._message_created_ts = None
         self._accumulated = ""
@@ -277,6 +355,9 @@ class GatewayStreamConsumer:
         if self._use_draft_streaming:
             type(self)._draft_id_counter += 1
             self._draft_id = type(self)._draft_id_counter
+        # Do not reset _context_scrubber here. memory-context tags can be split
+        # across tool/commentary/segment boundaries; resetting at boundaries can
+        # turn a partially seen fence into user-visible text.
 
     def on_delta(self, text: str) -> None:
         """Thread-safe callback — called from the agent's worker thread.
@@ -310,6 +391,9 @@ class GatewayStreamConsumer:
         discarded.  Partial tags at buffer boundaries are held back in
         ``_think_buffer`` until enough characters arrive to decide.
         """
+        text = self._context_scrubber.feed(text)
+        if not text:
+            return
         buf = self._think_buffer + text
         self._think_buffer = ""
 
@@ -414,6 +498,15 @@ class GatewayStreamConsumer:
         )
         _raw_limit = getattr(self.adapter, "MAX_MESSAGE_LENGTH", 4096)
         _safe_limit = max(500, _raw_limit - _len_fn(self.cfg.cursor) - 100)
+        # Promote to instance attributes so helper methods that fire after
+        # ``run()`` returns (e.g. ``_send_commentary``) can reuse the same
+        # length function and platform budget. Without this, helpers would
+        # either re-resolve (duplicating the isinstance check) or hit a
+        # NameError because the local is out of scope.
+        # feat/telegram-edit-mode-merge: _send_commentary needs _len_fn and
+        # _safe_limit to gate merged-commentary overflow detection.
+        self._len_fn = _len_fn
+        self._safe_limit = _safe_limit
 
         # Resolve native draft streaming once per run.  When enabled the
         # consumer routes mid-stream frames through adapter.send_draft and
@@ -428,6 +521,22 @@ class GatewayStreamConsumer:
                 "Stream consumer using native-draft transport (chat=%s draft_id=%s)",
                 self.chat_id, self._draft_id,
             )
+
+        # --- feat/telegram-edit-mode-merge: placeholder arming ---
+        # Send a "⏳ 正在思考..." placeholder after cfg.placeholder_delay_seconds
+        # if no delta has landed yet. Disabled when:
+        #   * placeholder_typing is False in config
+        #   * native draft streaming is active (drafts are a strictly better
+        #     version of the same UX — we don't want a placeholder standing
+        #     message in addition to the animating draft bubble)
+        #   * the adapter doesn't support plain sendMessage (e.g. voice-only)
+        self._stream_started_ts = time.monotonic()
+        self._placeholder_armed = bool(
+            self.cfg.placeholder_typing
+            and not self._use_draft_streaming
+            and self.cfg.placeholder_delay_seconds > 0
+            and hasattr(self.adapter, "send")
+        )
 
         try:
             while True:
@@ -455,7 +564,59 @@ class GatewayStreamConsumer:
                 # so trailing text that was waiting for a potential open
                 # tag is not lost.
                 if got_done:
+                    tail = self._context_scrubber.flush()
+                    if tail:
+                        self._filter_and_accumulate(tail)
                     self._flush_think_buffer()
+
+                # --- feat/telegram-edit-mode-merge: emit placeholder ---
+                # If the timer is up and we still have no real text and no
+                # live message, send the placeholder. The first real delta
+                # will replace it via the normal edit path below — we just
+                # need to keep ``_accumulated`` consistent with what's on
+                # screen so no duplicate text appears.
+                if (
+                    self._placeholder_armed
+                    and not self._placeholder_active
+                    and not self._accumulated
+                    and self._message_id is None
+                ):
+                    elapsed_since_start = (
+                        time.monotonic() - self._stream_started_ts
+                    )
+                    if elapsed_since_start >= self.cfg.placeholder_delay_seconds:
+                        try:
+                            result = await self.adapter.send(
+                                chat_id=self.chat_id,
+                                content=self.cfg.placeholder_text,
+                                reply_to=self._initial_reply_to_id,
+                                metadata=self.metadata,
+                            )
+                            if result.success and result.message_id:
+                                self._message_id = result.message_id
+                                self._message_created_ts = time.monotonic()
+                                # Seed _accumulated with the placeholder so
+                                # the next edit appends rather than replaces.
+                                self._accumulated = self.cfg.placeholder_text
+                                self._last_sent_text = self.cfg.placeholder_text
+                                self._placeholder_active = True
+                                # already_sent=True so the gateway doesn't
+                                # fall back to a redundant final-send path
+                                # when the first real delta is tiny.
+                                self._already_sent = True
+                                self._notify_new_message()
+                                logger.debug(
+                                    "Stream consumer sent placeholder after %.2fs",
+                                    elapsed_since_start,
+                                )
+                        except Exception as e:
+                            logger.debug(
+                                "Placeholder send failed; continuing without: %s",
+                                e,
+                            )
+                        # Whether or not the send succeeded, disarm the
+                        # timer so we don't retry on every tick.
+                        self._placeholder_armed = False
 
                 # Decide whether to flush an edit
                 now = time.monotonic()
@@ -607,7 +768,11 @@ class GatewayStreamConsumer:
                     return
 
                 if commentary_text is not None:
-                    self._reset_segment_state()
+                    # feat/telegram-edit-mode-merge: _send_commentary runs
+                    # BEFORE _reset_segment_state so its merge path can read
+                    # ``self._accumulated`` (the prior streaming text) and
+                    # build a merged edit. The trailing reset still happens
+                    # to clear bookkeeping for the next text segment.
                     await self._send_commentary(commentary_text)
                     self._last_edit_time = time.monotonic()
                     self._reset_segment_state()
@@ -686,9 +851,14 @@ class GatewayStreamConsumer:
         stream finishes — we just need to hide the raw directives from the
         user.
         """
-        if "MEDIA:" not in text and "[[audio_as_voice]]" not in text:
-            return text
-        cleaned = text.replace("[[audio_as_voice]]", "")
+        try:
+            from agent.memory_manager import sanitize_context
+            cleaned = sanitize_context(text)
+        except Exception:
+            cleaned = text
+        if "MEDIA:" not in cleaned and "[[audio_as_voice]]" not in cleaned:
+            return cleaned
+        cleaned = cleaned.replace("[[audio_as_voice]]", "")
         cleaned = GatewayStreamConsumer._MEDIA_RE.sub("", cleaned)
         # Collapse excessive blank lines left behind by removed tags
         cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
@@ -1032,11 +1202,69 @@ class GatewayStreamConsumer:
             pass  # best-effort — don't let this block the fallback path
 
     async def _send_commentary(self, text: str) -> bool:
-        """Send a completed interim assistant commentary message."""
+        """Deliver a completed interim assistant commentary message.
+
+        Two paths:
+        * Default (``cfg.merge_interim_text=True``) — if a streaming message
+          already exists, append the commentary to it via edit_message and
+          return. This is the "scheme 2" behavior Bocchi asked for: one
+          persistent message per response, edited in place across the whole
+          tool round-trip.
+        * Legacy path (``cfg.merge_interim_text=False``) — send a new
+          standalone message, matching the pre-merge behavior preserved for
+          platforms / setups that rely on the per-commentary bubble.
+        """
         text = self._clean_for_display(text)
         if not text.strip():
             return False
         try:
+            # --- Scheme 2 merge path ---
+            # If we already have a live streaming message and edits are
+            # supported, append the commentary to the bottom of the
+            # accumulated text and edit in place. This keeps the whole
+            # tool round-trip in a single user-visible bubble.
+            #
+            # We deliberately reuse ``_accumulated`` rather than a separate
+            # commentary channel so the next on_delta just continues the
+            # existing text — no special "commentary" formatting is
+            # introduced, matching the user's "no extra frills" preference.
+            if (
+                self.cfg.merge_interim_text
+                and self._message_id is not None
+                and self._edit_supported
+                and not self._use_draft_streaming
+            ):
+                # Avoid the merge if accumulated text already contains the
+                # commentary verbatim (LLM double-emit safety).
+                if text in self._accumulated:
+                    return True
+                separator = "\n\n" if self._accumulated else ""
+                merged = self._accumulated + separator + text
+                # If the merged text overflows the platform limit, fall
+                # through to the standalone path so the platform layer can
+                # split it correctly rather than truncating mid-commentary.
+                if self._len_fn(merged) <= self._safe_limit:
+                    result = await self._edit_message(
+                        message_id=self._message_id,
+                        content=merged,
+                    )
+                    if result.success:
+                        self._accumulated = merged
+                        self._last_sent_text = (
+                            self._last_sent_text + separator + text
+                            if self._last_sent_text
+                            else merged
+                        )
+                        self._already_sent = True
+                        return True
+                    # Edit failure (rate limit etc.) — let the standalone
+                    # path try so the user at least sees the commentary.
+                    logger.debug(
+                        "Commentary merge edit failed (%s); falling back to standalone send",
+                        getattr(result, "error", "unknown"),
+                    )
+
+            # --- Legacy standalone path ---
             result = await self.adapter.send(
                 chat_id=self.chat_id,
                 content=text,

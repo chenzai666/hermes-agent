@@ -379,7 +379,14 @@ class TestSegmentBreakOnToolBoundary:
         adapter.edit_message = AsyncMock(return_value=edit_result)
         adapter.MAX_MESSAGE_LENGTH = 4096
 
-        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
+        config = StreamConsumerConfig(
+            edit_interval=0.01,
+            buffer_threshold=5,
+            # feat/telegram-edit-mode-merge: opt out of the new default merge
+            # behavior to exercise the legacy "create a fresh message after
+            # a tool boundary" contract this test was written for.
+            merge_segment_breaks=False,
+        )
         consumer = GatewayStreamConsumer(adapter, "chat_123", config)
 
         # Phase 1: intermediate text before tool calls
@@ -472,7 +479,13 @@ class TestSegmentBreakOnToolBoundary:
         adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
         adapter.MAX_MESSAGE_LENGTH = 4096
 
-        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5)
+        config = StreamConsumerConfig(
+            edit_interval=0.01,
+            buffer_threshold=5,
+            # feat/telegram-edit-mode-merge: opt out of the new default merge
+            # behavior to exercise the legacy "one message per segment" path.
+            merge_segment_breaks=False,
+        )
         consumer = GatewayStreamConsumer(adapter, "chat_123", config)
 
         consumer.on_delta("Phase 1")
@@ -551,7 +564,15 @@ class TestSegmentBreakOnToolBoundary:
         adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=False, error="flood_control:6"))
         adapter.MAX_MESSAGE_LENGTH = 4096
 
-        config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
+        config = StreamConsumerConfig(
+            edit_interval=0.01,
+            buffer_threshold=5,
+            cursor=" ▉",
+            # feat/telegram-edit-mode-merge: opt out of the new default merge
+            # behavior to exercise the legacy "segment break creates a new
+            # message" path the #8124 regression was pinned to.
+            merge_segment_breaks=False,
+        )
         consumer = GatewayStreamConsumer(adapter, "chat_123", config)
 
         consumer.on_delta("Hello")
@@ -1908,3 +1929,234 @@ class TestUtf16OverflowDetection:
         # this file passing — they all use MagicMock adapters.
         assert consumer is not None
 
+
+
+# ── Telegram edit-mode merge tests (feat/telegram-edit-mode-merge) ──────
+
+
+class TestTelegramEditModeMerge:
+    """Verify the scheme-2 (one persistent message, edited in place) merge
+    controls. Each test pins a single behavior so a future refactor that
+    regresses one (e.g. accidentally re-enabling per-commentary standalone
+    sends) fails loudly with an actionable diff."""
+
+    @pytest.mark.asyncio
+    async def test_placeholder_emitted_after_delay(self):
+        """If the LLM is slow, the consumer sends a '⏳ 正在思考...' placeholder
+        after the configured delay and the first real delta replaces it."""
+        import asyncio
+        adapter = MagicMock()
+        placeholder_send = SimpleNamespace(success=True, message_id="ph_1")
+        adapter.send = AsyncMock(return_value=placeholder_send)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(
+            edit_interval=0.01,
+            buffer_threshold=5,
+            placeholder_typing=True,
+            placeholder_delay_seconds=0.05,
+            placeholder_text="⏳ 正在思考...",
+        )
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        # Force the run loop to tick without producing any delta, so the
+        # placeholder timer fires.
+        async def deliver_after_delay():
+            await asyncio.sleep(0.08)
+            consumer.on_delta("Hello")
+            consumer.finish()
+
+        deliver_task = asyncio.create_task(deliver_after_delay())
+        await consumer.run()
+        await deliver_task
+
+        # Exactly one send (the placeholder) and one or more edits (deltas
+        # + final). The placeholder must appear as the send content.
+        assert adapter.send.await_count == 1
+        first_send = adapter.send.call_args_list[0]
+        assert "正在思考" in first_send[1]["content"]
+        # All edits target the placeholder message id (ph_1). The final
+        # edit drops the cursor and contains the real text — earlier edits
+        # may show "⏳ ...Hello ▉" mid-stream.
+        assert all(
+            call[1]["message_id"] == "ph_1"
+            for call in adapter.edit_message.call_args_list
+        ), (
+            f"Expected all edits to target ph_1, got: "
+            f"{[c[1]['message_id'] for c in adapter.edit_message.call_args_list]}"
+        )
+        final_edit = adapter.edit_message.call_args_list[-1]
+        assert "Hello" in final_edit[1]["content"]
+        # Cursor must be gone from the final edit (no streaming bubble).
+        assert "▉" not in final_edit[1]["content"]
+        # already_sent must be True after the placeholder so the gateway
+        # doesn't trigger a redundant final-send path on tiny first deltas.
+        assert consumer.already_sent
+
+    @pytest.mark.asyncio
+    async def test_placeholder_skipped_when_first_delta_is_fast(self):
+        """If the LLM emits a delta before the delay elapses, no placeholder
+        is sent. The first delta goes straight to send_message + edit."""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(
+            edit_interval=0.01,
+            buffer_threshold=5,
+            placeholder_delay_seconds=10.0,  # never fires in this test
+        )
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("Fast first token")
+        consumer.finish()
+        await consumer.run()
+
+        # Only one send (the first delta) and edits, no placeholder.
+        assert adapter.send.await_count == 1
+        first_send = adapter.send.call_args_list[0]
+        assert "Fast" in first_send[1]["content"]
+        assert "正在思考" not in first_send[1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_placeholder_disabled_via_config(self):
+        """When placeholder_typing=False, the consumer never sends a
+        placeholder even if the LLM is slow."""
+        import asyncio
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(
+            edit_interval=0.01,
+            buffer_threshold=5,
+            placeholder_typing=False,
+            placeholder_delay_seconds=0.01,
+        )
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        async def deliver_after_delay():
+            await asyncio.sleep(0.05)
+            consumer.on_delta("Hello")
+            consumer.finish()
+
+        deliver_task = asyncio.create_task(deliver_after_delay())
+        await consumer.run()
+        await deliver_task
+
+        # No placeholder — the only send is the first delta content.
+        assert adapter.send.await_count == 1
+        assert "正在思考" not in adapter.send.call_args_list[0][1]["content"]
+
+    @pytest.mark.asyncio
+    async def test_commentary_merged_into_existing_message(self):
+        """on_commentary while a streaming message exists must edit it
+        in place (scheme 2), not post a new standalone message."""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(
+            edit_interval=0.01,
+            buffer_threshold=5,
+            merge_interim_text=True,
+        )
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        # First delta creates the streaming message
+        consumer.on_delta("Reasoning step. ")
+        # Commentary arrives while the message is still live
+        consumer.on_commentary("Checking the docs first.")
+        consumer.finish()
+        await consumer.run()
+
+        # Only one send (the first delta created msg_1). The commentary
+        # was merged in via edit_message, not a second send.
+        assert adapter.send.await_count == 1
+        # At least one edit merged the commentary into the existing text.
+        merged_edits = [
+            call[1]["content"]
+            for call in adapter.edit_message.call_args_list
+            if "Checking the docs first." in call[1]["content"]
+        ]
+        assert merged_edits, (
+            f"Commentary was not merged into the streaming message; "
+            f"edits were: {[c[1]['content'] for c in adapter.edit_message.call_args_list]}"
+        )
+        # The full merged text is on screen.
+        full_edit = merged_edits[-1]
+        assert "Reasoning step." in full_edit
+        assert "Checking the docs first." in full_edit
+
+    @pytest.mark.asyncio
+    async def test_commentary_no_existing_message_creates_one(self):
+        """If commentary arrives before any delta (no message to merge
+        into), it falls through to a standalone send — there's nothing
+        else to do."""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(
+            edit_interval=0.01,
+            buffer_threshold=5,
+            merge_interim_text=True,
+        )
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_commentary("I'll check first.")
+        consumer.finish()
+        await consumer.run()
+
+        # The commentary was delivered as a standalone send.
+        assert adapter.send.await_count == 1
+        sent_content = adapter.send.call_args_list[0][1]["content"]
+        assert "I'll check first." in sent_content
+
+    @pytest.mark.asyncio
+    async def test_segment_break_merges_into_existing_message(self):
+        """On_delta(None) is a tool boundary. With merge_segment_breaks=True
+        (the new default) the next text segment edits the same message
+        instead of opening a new one."""
+        adapter = MagicMock()
+        send_result = SimpleNamespace(success=True, message_id="msg_1")
+        adapter.send = AsyncMock(return_value=send_result)
+        adapter.edit_message = AsyncMock(return_value=SimpleNamespace(success=True))
+        adapter.MAX_MESSAGE_LENGTH = 4096
+
+        config = StreamConsumerConfig(
+            edit_interval=0.01,
+            buffer_threshold=5,
+            merge_segment_breaks=True,
+        )
+        consumer = GatewayStreamConsumer(adapter, "chat_123", config)
+
+        consumer.on_delta("Pre-tool text. ")
+        consumer.on_delta(None)  # tool boundary
+        consumer.on_delta("Post-tool text.")
+        consumer.finish()
+        await consumer.run()
+
+        # Only one send (the first delta created msg_1). The post-tool
+        # text edited the same message.
+        assert adapter.send.await_count == 1
+        assert adapter.send.call_args_list[0][1]["content"].startswith("Pre-tool text")
+        # The post-tool text must appear in an edit on msg_1.
+        post_tool_edits = [
+            call for call in adapter.edit_message.call_args_list
+            if call[1]["message_id"] == "msg_1"
+            and "Post-tool text." in call[1]["content"]
+        ]
+        assert post_tool_edits, (
+            f"Post-tool text was not edited onto msg_1; edits were: "
+            f"{[(c[1]['message_id'], c[1]['content']) for c in adapter.edit_message.call_args_list]}"
+        )
