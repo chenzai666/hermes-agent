@@ -285,6 +285,22 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
     return bool(_GATEWAY_PROVIDER_ERROR_SHAPE_RE.search(body))
 
 
+def _sanitize_gateway_inbound_user_text(text: Any) -> Any:
+    """Strip internally injected memory-context from user-visible inbound text.
+
+    Some gateway/platform chains can append recalled-memory blocks to the text
+    passed into the agent.  User text must remain only what the user actually
+    typed before it is logged, persisted, or sent to the model.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    try:
+        from agent.memory_manager import sanitize_context
+        return sanitize_context(text).strip()
+    except Exception:
+        return text
+
+
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to high-noise chats.
 
@@ -298,6 +314,11 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
         return text
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
+    try:
+        from agent.memory_manager import sanitize_context as _sanitize_gateway_context
+        redacted = _sanitize_gateway_context(redacted).strip()
+    except Exception:
+        pass
     if _looks_like_gateway_provider_error(redacted):
         return _gateway_provider_error_reply(redacted)
     return redacted
@@ -7410,6 +7431,9 @@ class GatewayRunner:
         7. Return response
         """
         source = event.source
+        _clean_event_text = _sanitize_gateway_inbound_user_text(getattr(event, "text", ""))
+        if isinstance(_clean_event_text, str) and _clean_event_text != getattr(event, "text", ""):
+            event = dataclasses.replace(event, text=_clean_event_text)
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -8844,6 +8868,9 @@ class GatewayRunner:
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
         _msg_start_time = time.time()
+        _clean_event_text = _sanitize_gateway_inbound_user_text(getattr(event, "text", ""))
+        if isinstance(_clean_event_text, str) and _clean_event_text != getattr(event, "text", ""):
+            event = dataclasses.replace(event, text=_clean_event_text)
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
         logger.info(
@@ -10486,6 +10513,10 @@ class GatewayRunner:
             "",
             t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
         ])
+
+        session_info = self._format_session_info()
+        if session_info:
+            lines.extend(["", session_info])
 
         return "\n".join(lines)
 
@@ -16800,6 +16831,19 @@ class GatewayRunner:
                         fresh_final_after_seconds=_fresh_final_secs,
                         transport=_scfg.transport or "edit",
                         chat_type=getattr(source, "chat_type", "") or "",
+                        # feat/telegram-edit-mode-merge: enable the full
+                        # scheme-2 behavior for Telegram by default. The
+                        # consumer's own defaults stay conservative so
+                        # other channels (Discord, Slack, Signal) keep
+                        # their existing per-segment / per-commentary
+                        # bubble UX.  Operators that want to opt out can
+                        # set these to False in their gateway config.
+                        merge_interim_text=(
+                            source.platform == Platform.TELEGRAM
+                        ),
+                        merge_segment_breaks=(
+                            source.platform == Platform.TELEGRAM
+                        ),
                     )
                     _stream_consumer = GatewayStreamConsumer(
                         adapter=_adapter,
@@ -17803,6 +17847,15 @@ class GatewayRunner:
                             fresh_final_after_seconds=_fresh_final_secs,
                             transport=_scfg.transport or "edit",
                             chat_type=getattr(source, "chat_type", "") or "",
+                            # feat/telegram-edit-mode-merge: enable scheme-2
+                            # for the status stream too. See the matching
+                            # block in the proxy stream consumer above.
+                            merge_interim_text=(
+                                source.platform == Platform.TELEGRAM
+                            ),
+                            merge_segment_breaks=(
+                                source.platform == Platform.TELEGRAM
+                            ),
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
