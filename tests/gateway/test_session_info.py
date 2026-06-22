@@ -80,12 +80,13 @@ class TestFormatSessionInfo:
         assert "Endpoint" not in info
 
     def test_million_context_format(self, runner, tmp_path):
-        p1, p2, p3 = _patch_info(tmp_path, "model:\n  default: test-model\n  context_length: 1000000\n",
-                                  "test-model",
+        p1, p2, p3 = _patch_info(tmp_path, "model:\n  default: gpt-5.5\n  context_length: 1050000\n",
+                                  "gpt-5.5",
                                   {"provider": "", "base_url": "", "api_key": ""})
         with p1, p2, p3:
             info = runner._format_session_info()
-        assert "1.0M" in info
+        assert "1,050,000 tokens" in info
+        assert "1.0M" not in info
 
     def test_missing_config(self, runner, tmp_path):
         """No config.yaml should not crash."""
