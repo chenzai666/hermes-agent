@@ -182,6 +182,10 @@ def sanitize_context(text: str) -> str:
     text = _FENCE_CLOSE_TAG_RE.sub('', text)
     text = _UNCLOSED_CONTEXT_RE.sub('', text)
     text = _FENCE_TAG_RE.sub('', text)
+    # Remove inline fence markers too, while preserving ordinary inline text.
+    # This catches malformed/escaped tag fragments without treating a normal
+    # discussion that merely mentions memory-context as an injected block.
+    text = re.sub(r'</?\s*memory-context\s*>', '', text, flags=re.IGNORECASE)
     return text
 
 

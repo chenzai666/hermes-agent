@@ -742,54 +742,55 @@ class GatewayStreamConsumer:
                         await self._suppress_silence_marker()
                         return
 
-                    # --- feat/telegram-edit-mode-merge: emit placeholder ---
-                    # If the timer is up and we still have no real text and no
-                    # live message, send the placeholder. The first real delta
-                    # will replace it via the normal edit path below — we just
-                    # need to keep ``_accumulated`` consistent with what's on
-                    # screen so no duplicate text appears.
-                    if (
-                        self._placeholder_armed
-                        and not self._placeholder_active
-                        and not self._accumulated
-                        and self._message_id is None
-                    ):
-                        elapsed_since_start = (
-                            time.monotonic() - self._stream_started_ts
-                        )
-                        if elapsed_since_start >= self.cfg.placeholder_delay_seconds:
-                            try:
-                                result = await self.adapter.send(
-                                    chat_id=self.chat_id,
-                                    content=self.cfg.placeholder_text,
-                                    reply_to=self._initial_reply_to_id,
-                                    metadata=self.metadata,
-                                )
-                                if result.success and result.message_id:
-                                    self._message_id = result.message_id
-                                    self._message_created_ts = time.monotonic()
-                                    # Seed _accumulated with the placeholder so
-                                    # the next edit appends rather than replaces.
-                                    self._accumulated = self.cfg.placeholder_text
-                                    self._last_sent_text = self.cfg.placeholder_text
-                                    self._placeholder_active = True
-                                    # already_sent=True so the gateway doesn't
-                                    # fall back to a redundant final-send path
-                                    # when the first real delta is tiny.
-                                    self._already_sent = True
-                                    self._notify_new_message()
-                                    logger.debug(
-                                        "Stream consumer sent placeholder after %.2fs",
-                                        elapsed_since_start,
-                                    )
-                            except Exception as e:
+                # --- feat/telegram-edit-mode-merge: emit placeholder ---
+                # If the timer is up and we still have no real text and no
+                # live message, send the placeholder. The first real delta
+                # will replace it via the normal edit path below — we just
+                # need to keep ``_accumulated`` consistent with what's on
+                # screen so no duplicate text appears.
+                if (
+                    self._placeholder_armed
+                    and not self._placeholder_active
+                    and not self._accumulated
+                    and self._message_id is None
+                ):
+                    elapsed_since_start = (
+                        time.monotonic() - self._stream_started_ts
+                    )
+                    if elapsed_since_start >= self.cfg.placeholder_delay_seconds:
+                        try:
+                            result = await self.adapter.send(
+                                chat_id=self.chat_id,
+                                content=self.cfg.placeholder_text,
+                                reply_to=self._initial_reply_to_id,
+                                metadata=self.metadata,
+                            )
+                            if result.success and result.message_id:
+                                self._message_id = result.message_id
+                                self._message_created_ts = time.monotonic()
+                                # Seed _accumulated with the placeholder so
+                                # the next edit appends rather than replaces.
+                                self._accumulated = self.cfg.placeholder_text
+                                self._last_sent_text = self.cfg.placeholder_text
+                                self._placeholder_active = True
+                                # already_sent=True so the gateway doesn't
+                                # fall back to a redundant final-send path
+                                # when the first real delta is tiny.
+                                self._already_sent = True
+                                self._notify_new_message()
                                 logger.debug(
-                                    "Placeholder send failed; continuing without: %s",
-                                    e,
+                                    "Stream consumer sent placeholder after %.2fs",
+                                    elapsed_since_start,
                                 )
-                            # Whether or not the send succeeded, disarm the
-                            # timer so we don't retry on every tick.
-                            self._placeholder_armed = False
+                        except Exception as e:
+                            logger.debug(
+                                "Placeholder send failed; continuing without: %s",
+                                e,
+                            )
+                        # Whether or not the send succeeded, disarm the
+                        # timer so we don't retry on every tick.
+                        self._placeholder_armed = False
+
 
                 # Decide whether to flush an edit
                 now = time.monotonic()

@@ -13903,10 +13903,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._session_db:
             try:
                 title = self._session_db.get_session_title(session_entry.session_id)
+                if inspect.isawaitable(title):
+                    title = await title
             except Exception:
                 title = None
             try:
                 row = self._session_db.get_session(session_entry.session_id)
+                if inspect.isawaitable(row):
+                    row = await row
                 if row:
                     db_total_tokens = (
                         (row.get("input_tokens") or 0)
