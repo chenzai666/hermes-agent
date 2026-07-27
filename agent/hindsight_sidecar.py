@@ -12,11 +12,13 @@ learning with OpenClaw.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import re
+import time
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional
 
 MEMORY_LAYER_ORDER = ("persona", "scenario", "atom")
@@ -41,6 +43,10 @@ class HindsightSidecarConfig:
     hermes_bank_template: str = "hermes:user:{user_id}"
     shared_user_bank_template: str = "shared:user:{user_id}"
     shared_ops_bank: str = "shared:ops"
+    near_dup_enabled: bool = True
+    near_dup_window_days: int = 30
+    near_dup_jaccard: float = 0.78
+    near_dup_recall_limit: int = 8
 
 
 def _cfg(path: str, default: Any) -> Any:
@@ -77,6 +83,10 @@ def load_sidecar_config() -> HindsightSidecarConfig:
         hermes_bank_template=str(_cfg("hindsight_sidecar.hermes_bank_template", "hermes:user:{user_id}")),
         shared_user_bank_template=str(_cfg("hindsight_sidecar.shared_user_bank_template", "shared:user:{user_id}")),
         shared_ops_bank=str(_cfg("hindsight_sidecar.shared_ops_bank", "shared:ops")),
+        near_dup_enabled=bool(_cfg("hindsight_sidecar.near_dup_enabled", True)),
+        near_dup_window_days=int(_cfg("hindsight_sidecar.near_dup_window_days", 30) or 30),
+        near_dup_jaccard=float(_cfg("hindsight_sidecar.near_dup_jaccard", 0.78) or 0.78),
+        near_dup_recall_limit=int(_cfg("hindsight_sidecar.near_dup_recall_limit", 8) or 8),
     )
 
 
@@ -155,6 +165,8 @@ def _layer_section_title(layer: str) -> str:
 class HindsightSidecar:
     def __init__(self, config: Optional[HindsightSidecarConfig] = None):
         self.config = config or load_sidecar_config()
+        self._recent_fp_cache: Dict[str, float] = {}
+        self._recent_text_cache: Dict[str, List[Dict[str, Any]]] = {}
 
     @property
     def enabled(self) -> bool:
@@ -177,6 +189,9 @@ class HindsightSidecar:
             "hermes_bank_template": self.config.hermes_bank_template,
             "shared_user_bank_template": self.config.shared_user_bank_template,
             "shared_ops_bank": self.config.shared_ops_bank,
+            "near_dup_enabled": self.config.near_dup_enabled,
+            "near_dup_window_days": self.config.near_dup_window_days,
+            "near_dup_jaccard": self.config.near_dup_jaccard,
         }
 
     def healthcheck(self) -> Dict[str, Any]:
@@ -215,6 +230,172 @@ class HindsightSidecar:
         except Exception:
             return {"raw": raw}
 
+    @staticmethod
+    def _normalize_for_fingerprint(text: str) -> str:
+        s = str(text or "").lower()
+        s = re.sub(r"source:\s*openclaw[^\n]*", " ", s, flags=re.I)
+        s = re.sub(r"owner:\s*[^\n]*|session:\s*[^\n]*|task id:\s*[^\n]*|turn id:\s*[^\n]*|chunk id:\s*[^\n]*|role:\s*[^\n]*", " ", s, flags=re.I)
+        s = re.sub(r"\|?\s*when:\s*[^|]+", " ", s, flags=re.I)
+        s = re.sub(r"\|?\s*involving:\s*[^|]+", " ", s, flags=re.I)
+        s = re.sub(r"\bpid\s*[:=]?\s*\d+\b", "pid", s, flags=re.I)
+        s = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "date", s)
+        s = re.sub(r"\b\d+(?:\.\d+)?\s*(?:gb|mb|kb|%)\b", "n", s, flags=re.I)
+        s = re.sub(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b", "ip", s)
+        s = re.sub(r"https?://\S+", "url", s, flags=re.I)
+        if re.search(r"gateway", s) and re.search(r"内存|rss|swap|物理空闲", s):
+            s = "topic gateway memory pressure " + s
+        if re.search(r"gateway", s) and re.search(r"重启|restart", s) and re.search(r"确认|中断", s):
+            s = "topic gateway restart confirm " + s
+        s = re.sub(r"[^0-9a-z\u4e00-\u9fff]+", " ", s)
+        s = re.sub(r"([\u4e00-\u9fff])", r" \1 ", s)
+        return re.sub(r"\s+", " ", s).strip()
+
+    @classmethod
+    def _token_set(cls, text: str) -> set[str]:
+        raw = [t for t in cls._normalize_for_fingerprint(text).split(" ") if t]
+        stop = {"的", "了", "和", "与", "及", "并", "在", "是", "为", "仍", "高", "仅", "约", "需", "但", "可", "n", "0", "23"}
+        out: set[str] = set()
+        for i, t in enumerate(raw):
+            if not t or t in stop:
+                continue
+            if re.fullmatch(r"[\u4e00-\u9fff]", t):
+                out.add(t)
+                if i + 1 < len(raw) and re.fullmatch(r"[\u4e00-\u9fff]", raw[i + 1]):
+                    out.add(t + raw[i + 1])
+            elif len(t) >= 2:
+                out.add(t)
+        for t in raw:
+            if t.startswith("topic") or t in {"gateway", "memory", "pressure"}:
+                out.add(t)
+        return out
+
+    @classmethod
+    def _fingerprint(cls, text: str) -> str:
+        tokens = sorted(cls._token_set(text))
+        if not tokens:
+            return ""
+        return hashlib.sha1(" ".join(tokens).encode("utf-8")).hexdigest()[:24]
+
+    @classmethod
+    def _jaccard(cls, a: str, b: str) -> float:
+        sa = cls._token_set(a)
+        sb = cls._token_set(b)
+        if not sa or not sb:
+            return 0.0
+        inter = len(sa & sb)
+        union = len(sa | sb)
+        return inter / union if union else 0.0
+
+    def _cache_get(self, bank_id: str, fp: str) -> bool:
+        key = f"{bank_id}:{fp}"
+        ts = self._recent_fp_cache.get(key)
+        if not ts:
+            return False
+        if time.time() - ts > 6 * 3600:
+            self._recent_fp_cache.pop(key, None)
+            return False
+        return True
+
+    def _cache_put(self, bank_id: str, fp: str) -> None:
+        if fp:
+            self._recent_fp_cache[f"{bank_id}:{fp}"] = time.time()
+
+    def _remember_text(self, bank_id: str, content: str) -> None:
+        body = str(content or "").strip()
+        if not body:
+            return
+        now = time.time()
+        arr = [x for x in self._recent_text_cache.get(bank_id, []) if now - float(x.get("ts", 0)) <= 6 * 3600]
+        arr.insert(0, {"text": body, "ts": now})
+        self._recent_text_cache[bank_id] = arr[:200]
+        self._cache_put(bank_id, self._fingerprint(body))
+
+    def _local_text_duplicate(self, bank_id: str, content: str) -> Optional[Dict[str, Any]]:
+        body = str(content or "").strip()
+        if not body:
+            return None
+        now = time.time()
+        arr = [x for x in self._recent_text_cache.get(bank_id, []) if now - float(x.get("ts", 0)) <= 6 * 3600]
+        self._recent_text_cache[bank_id] = arr
+        for item in arr:
+            text = str(item.get("text") or "")
+            if self._fingerprint(text) == self._fingerprint(body):
+                return {"duplicate": True, "reason": "local_text_fp", "fingerprint": self._fingerprint(body), "matched": text[:120]}
+            sim = self._jaccard(body, text)
+            if sim >= float(self.config.near_dup_jaccard):
+                return {
+                    "duplicate": True,
+                    "reason": "local_text_jaccard",
+                    "fingerprint": self._fingerprint(body),
+                    "similarity": round(sim, 3),
+                    "matched": text[:120],
+                }
+        return None
+
+    def _is_near_duplicate(self, bank_id: str, content: str) -> Dict[str, Any]:
+        if not self.config.near_dup_enabled:
+            return {"duplicate": False}
+        body = str(content or "").strip()
+        if not body:
+            return {"duplicate": False}
+        fp = self._fingerprint(body)
+        if not fp:
+            return {"duplicate": False}
+        if self._cache_get(bank_id, fp):
+            return {"duplicate": True, "reason": "local_fp_cache", "fingerprint": fp}
+        local = self._local_text_duplicate(bank_id, body)
+        if local and local.get("duplicate"):
+            self._cache_put(bank_id, fp)
+            return local
+        query = self._normalize_for_fingerprint(body)[:240] or body[:240]
+        try:
+            raw = self._post_json(f"/v1/default/banks/{bank_id}/memories/recall", {"query": query})
+        except Exception as exc:
+            logger.warning("[hindsight-sidecar] near-dup recall failed bank=%s: %s", bank_id, exc)
+            return {"duplicate": False, "reason": "checker_error"}
+        items = raw.get("results") or (raw.get("data") or {}).get("results") or []
+        window_s = max(1, int(self.config.near_dup_window_days)) * 86400
+        now = time.time()
+        checked = 0
+        for item in items:
+            if checked >= int(self.config.near_dup_recall_limit):
+                break
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or item.get("content") or item.get("summary") or "").strip()
+            if not text:
+                continue
+            checked += 1
+            ts_raw = item.get("event_date") or item.get("created_at") or item.get("mentioned_at")
+            if ts_raw:
+                try:
+                    if isinstance(ts_raw, (int, float)):
+                        ts = float(ts_raw)
+                        if ts > 1e12:
+                            ts /= 1000.0
+                    else:
+                        from datetime import datetime
+                        ts = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00")).timestamp()
+                    if now - ts > window_s:
+                        continue
+                except Exception:
+                    pass
+            existing_fp = self._fingerprint(text)
+            if existing_fp and existing_fp == fp:
+                self._cache_put(bank_id, fp)
+                return {"duplicate": True, "reason": "fingerprint_match", "fingerprint": fp, "matched": text[:120]}
+            sim = self._jaccard(body, text)
+            if sim >= float(self.config.near_dup_jaccard):
+                self._cache_put(bank_id, fp)
+                return {
+                    "duplicate": True,
+                    "reason": "jaccard_match",
+                    "fingerprint": fp,
+                    "similarity": round(sim, 3),
+                    "matched": text[:120],
+                }
+        return {"duplicate": False, "fingerprint": fp, "checked": checked}
+
     def retain(
         self,
         *,
@@ -227,6 +408,25 @@ class HindsightSidecar:
     ) -> Dict[str, Any]:
         if not self.enabled or not content.strip():
             return {"skipped": True}
+        # Runtime diagnostic noise should not become durable shared memory.
+        if re.search(
+            r"Gateway\s*内存|RSS\s*[:=]?\s*\d|Swap\s*已用|物理空闲|Auto-recall|memory_search|LimitNOFILE|response_store",
+            content,
+            re.I,
+        ):
+            return {"skipped": True, "reason": "runtime_noise"}
+        dup = self._is_near_duplicate(bank_id, content)
+        if dup.get("duplicate"):
+            logger.info(
+                "[hindsight-sidecar] near-dup suppressed bank=%s reason=%s sim=%s fp=%s",
+                bank_id,
+                dup.get("reason"),
+                dup.get("similarity"),
+                dup.get("fingerprint"),
+            )
+            return {"skipped": True, "reason": "near_duplicate", "detail": dup}
+        # Remember before remote write so bursty near-dups collapse even if recall lags.
+        self._remember_text(bank_id, content)
         normalized_type = _normalize_memory_type(memory_type)
         rendered_content = content
         if not re.search(r"^Memory-Type:\s*(persona|scenario|atom)\b", rendered_content, re.IGNORECASE):
@@ -248,7 +448,9 @@ class HindsightSidecar:
             "async": False,
         }
         path = f"/v1/default/banks/{bank_id}/memories"
-        return self._post_json(path, payload)
+        result = self._post_json(path, payload)
+        self._remember_text(bank_id, content)
+        return result
 
     def reflect(self, *, bank_id: str, query: str) -> Dict[str, Any]:
         if not self.enabled:
