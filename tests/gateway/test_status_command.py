@@ -141,6 +141,33 @@ async def test_status_command_includes_live_agent_model_and_context():
     assert "**Lifetime tokens billed:** 1,250" in result
 
 
+def test_session_info_keeps_million_scale_context_exact(monkeypatch):
+    """Do not round the configured 1.05M window down to the misleading 1.0M."""
+    from gateway.run import GatewayRunner
+
+    monkeypatch.setattr(
+        "gateway.run._resolve_gateway_model", lambda: "cliproxy/gpt-5.6-terra"
+    )
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {
+            "model": {
+                "default": "cliproxy/gpt-5.6-terra",
+                "context_length": 1_050_000,
+                "provider": "cliproxy",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        "gateway.run._resolve_runtime_agent_kwargs", lambda: {"provider": "cliproxy"}
+    )
+
+    result = GatewayRunner._format_session_info(object())
+
+    assert "◆ Context: 1,050,000 tokens (config)" in result
+    assert "1.0M" not in result
+
+
 @pytest.mark.asyncio
 async def test_agents_command_reports_active_agents_and_processes(monkeypatch):
     session_key = build_session_key(_make_source())

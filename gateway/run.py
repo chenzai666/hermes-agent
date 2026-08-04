@@ -18249,9 +18249,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             ctx_source = "detected"
 
-        # Format context length for display
+        # Format context length for display. Use exact comma-separated values
+        # for million-scale contexts: rounding 1,050,000 to "1.0M" hides the
+        # verified provider limit and makes /status look like the config is
+        # wrong. Keep compact K notation only for smaller windows.
         if context_length >= 1_000_000:
-            ctx_display = f"{context_length / 1_000_000:.1f}M"
+            ctx_display = f"{context_length:,}"
         elif context_length >= 1_000:
             ctx_display = f"{context_length // 1_000}K"
         else:

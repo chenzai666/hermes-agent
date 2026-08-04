@@ -682,7 +682,10 @@ class PlatformConfig:
         #     api_server:
         #       extra:
         #         key: "..."         # works directly
-        _extra = dict(data.get("extra") or {})
+        # Use the already-normalized mapping: malformed ``extra`` values
+        # (for example a YAML scalar) must keep the configuration loader
+        # tolerant instead of making this compatibility bridge raise.
+        _extra = dict(extra)
         if "key" in data and "key" not in _extra:
             _extra["key"] = data["key"]
 
